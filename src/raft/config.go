@@ -38,8 +38,8 @@ type config struct {
 	mu        sync.Mutex
 	t         *testing.T
 	net       *labrpc.Network
-	n         int
-	rafts     []*Raft
+	n         int //集群中服务器的数量
+	rafts     []*Raft //节点实例s
 	applyErr  []string // from apply channel readers
 	connected []bool   // whether each server is on the net
 	saved     []*Persister
@@ -104,6 +104,7 @@ func (cfg *config) crash1(i int) {
 
 	// a fresh persister, in case old instance
 	// continues to update the Persister.
+	//原实例会被修改, 而我们要记录某个时刻的状态, 故copy
 	// but copy old persister's content so that we always
 	// pass Make() the last persisted state.
 	if cfg.saved[i] != nil {
@@ -132,6 +133,7 @@ func (cfg *config) crash1(i int) {
 // state persister, to isolate previous instance of
 // this server. since we cannot really kill it.
 //
+//@i  peer 的序号
 func (cfg *config) start1(i int) {
 	cfg.crash1(i)
 
@@ -146,7 +148,7 @@ func (cfg *config) start1(i int) {
 	ends := make([]*labrpc.ClientEnd, cfg.n)
 	for j := 0; j < cfg.n; j++ {
 		ends[j] = cfg.net.MakeEnd(cfg.endnames[i][j])
-		cfg.net.Connect(cfg.endnames[i][j], j)
+		cfg.net.Connect(cfg.endnames[i][j], j) //每个节点相互连接
 	}
 
 	cfg.mu.Lock()
@@ -156,6 +158,8 @@ func (cfg *config) start1(i int) {
 	// but copy old persister's content so that we always
 	// pass Make() the last persisted state.
 	if cfg.saved[i] != nil {
+		//既然非空, 为何要再copy?
+		//答:crash1, 允许原实例被修改, 我们通过copy记录某个时刻的内容
 		cfg.saved[i] = cfg.saved[i].Copy()
 	} else {
 		cfg.saved[i] = MakePersister()
@@ -166,13 +170,14 @@ func (cfg *config) start1(i int) {
 	// listen to messages from Raft indicating newly committed messages.
 	applyCh := make(chan ApplyMsg)
 	go func() {
-		for m := range applyCh {
+		for m := range applyCh {//fong until applyCh is closed
 			err_msg := ""
 			if m.CommandValid == false {
 				// ignore other types of ApplyMsg
 			} else if v, ok := (m.Command).(int); ok {
 				cfg.mu.Lock()
 				for j := 0; j < len(cfg.logs); j++ {
+					//fong:command就是条目, 本lab中.  j是服务器编号
 					if old, oldok := cfg.logs[j][m.CommandIndex]; oldok && old != v {
 						// some server has already committed a different value for this entry!
 						err_msg = fmt.Sprintf("commit index=%v server=%v %v != server=%v %v",
@@ -441,6 +446,7 @@ func (cfg *config) one(cmd int, expectedServers int, retry bool) int {
 				index1, _, ok := rf.Start(cmd)
 				if ok {
 					index = index1
+					debug_pr("===index1:%d\n", index1)
 					break
 				}
 			}
@@ -452,6 +458,7 @@ func (cfg *config) one(cmd int, expectedServers int, retry bool) int {
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
+				debug_pr("====nd:%d idx:%d expectedServers:%d\n",nd, index, expectedServers)
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd2, ok := cmd1.(int); ok && cmd2 == cmd {

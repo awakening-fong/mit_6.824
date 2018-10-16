@@ -13,6 +13,7 @@ import "sync"
 
 type Persister struct {
 	mu        sync.Mutex
+	//fong:当成文件来使用, 数据需要自己组织.
 	raftstate []byte
 	snapshot  []byte
 }
