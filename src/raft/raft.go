@@ -99,7 +99,7 @@ type Raft struct {
 
 	//Volatile state
 	//index of highest log entry known to be committed
-	commitIndex int
+	commitIndex int //初值为1
 	intmap_applied  map[int]int //XXX bitmap
 	//index of highest log entry applied to state machine 
 	lastApplied int
@@ -107,7 +107,7 @@ type Raft struct {
 	matchIndex []int //for leader
 	isleader bool //if major
 	timer_ele *time.Timer
-	lock_time_reset sync.Mutex
+	//lock_time_reset sync.Mutex
 	lock_start sync.Mutex
 	lock_ent sync.Mutex
 	last_reset time.Time
@@ -405,7 +405,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success=false 
 		return
 	}
-
+	/*
+	FIXME 需要新添加一个纯心跳 
+	因为有时  0  1  2 
+	0发送2 迟迟无法到达, 
+	导致1同意,  这样, 0获得过半, 
+	然后0发送空, 又过一会儿, 又发送空, 这可能导致把1的冲突项给清掉, 
+	但这时, 0还不是leader呢. 	 
+	*/
+	//
 	//非空 也是心跳, 对吗????	
 	rf.reset_ele_timer(args.LeaderId)
 
@@ -443,8 +451,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if rf.entries[args.PrevLogIndex].Term!=args.PrevLogTerm{ 
 			//tmp:=rf.entries[0:args.PrevLogIndex]
 			rf.entries=rf.entries[0:args.PrevLogIndex]
+			rf.commitIndex=len(rf.entries)
 			//告知leader, 请发送PrevLogIndex项过来
-			debug_pr("%d after resolve confilit:%v", rf.me, rf.entries)
+			if rf.commitIndex < 10 {
+				debug_pr("%d after resolve confilit:%v\n", rf.me, rf.entries)
+			}
+			reply.Follower_LastLogIndex=args.PrevLogIndex-1
 			reply.Success=false 
 			return  
 		}
@@ -492,7 +504,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		debug_pr("entry: %v\n", args.Entries[i])
 		rf.entries=append(rf.entries, args.Entries[i])
 	}
-	debug_pr("%d after append len:%d, val:%v\n",rf.me, len(rf.entries), rf.entries)
+	if len(rf.entries)<10 {
+		debug_pr("%d after append len:%d, val:%v\n",rf.me, len(rf.entries), rf.entries)
+	}
 	rf.apply(rf.lastApplied+1,args.LeaderLastApply+1)
 	//If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	if args.LeaderCommit>rf.commitIndex {
@@ -522,6 +536,9 @@ The restriction(指的是5.4) ensures that the leader for any given term contain
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.lock_RequestVote.Lock()
 	defer rf.lock_RequestVote.Unlock()
+	if rf.is_exiting {
+		return
+	}
 
 
 	// Your code here (2A, 2B).
@@ -578,7 +595,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			}
 		}
 		reply.VoteGranted=true
-        rf.reset_ele_timer(args.CandidateId) //FIXME 会导致问题吗????
+		//会导致问题吗? 答:不会. 这里是 投票给候选人了.
+        rf.reset_ele_timer(args.CandidateId) 
 		rf.convert_follower(by_votegrand, &args.CandidateId)
 		debug_pr("args logterm%d logindex%d\n",args.LastLogTerm, args.LastLogIndex)
 		debug_pr("%d votefor %d\n", rf.me, args.CandidateId);
@@ -697,7 +715,17 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 //true for ok
 //AppendEntries
 func  (rf *Raft) send_log(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) (app_ok bool, net_dis bool) {
+	if rf.is_exiting {
+		debug_pr("%d is_exiting\n", rf.me)
+		return false, true
+	}
+
 	for {
+	if rf.is_exiting {
+		debug_pr("%d is_exiting\n", rf.me)
+		return false, true
+	}
+
 	if rf.sendAppendEntries(server,args,reply) {
 		if reply.Success {
 			if !reply.IsHeart {
@@ -731,13 +759,16 @@ func  (rf *Raft) send_log(server int, args *AppendEntriesArgs, reply *AppendEntr
 			//AppendEntries
 			//dec prevlog
 			//XXX 
-			if args.PrevLogIndex<=1 {
+			/* 改用reply.Follower_LastLogIndex, 故这部分弃用*/
+
+			if args.PrevLogIndex<0 {
 				if reply.IsHeart {
 					return true, false
 				}
 				//debug_pr("BUG,%d, but try to dec\n", args.PrevLogIndex)
 				return true, false  //bad code
 			}
+			
 			/*
 			For example,
 when rejecting an AppendEntries request, the follower can include the term of the conflicting entry and the first
@@ -772,13 +803,17 @@ leader can decrement nextIndex to bypass all of the conflicting entries in that 
 func  (rf *Raft) set_lastApplied(new_follower_done int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	if rf.is_exiting {
+		debug_pr("%d is_exiting\n", rf.me)
+		return 
+	}
 
 	if rf.lastApplied < new_follower_done {
 		if rf.isleader {
 			rf.intmap_applied[new_follower_done]=1
 			debug_pr("===%d mark %d apply\n", rf.me, new_follower_done)
 			start:=rf.lastApplied+1
-			debug_pr("===%d start %d \n", rf.me, start)
+			debug_pr("===%d start %d, rf.commitIndex+1:%d \n", rf.me, start, rf.commitIndex+1)
 			for  i:=start;i<rf.commitIndex+1;i++{
 				_, ok := rf.intmap_applied[i] 
 				if ok {
@@ -795,9 +830,13 @@ func  (rf *Raft) set_lastApplied(new_follower_done int) {
 					break;
 				}
 			}
-		} else { //isleader
+		} else { //not  isleader
 			if rf.lastApplied+1!=new_follower_done {
 				//err_pr("BUG, %d want set lastApplied %d, but !=%d(lastApplied)+1\n",rf.me, rf.lastApplied, new_follower_done )
+				return
+			}
+			if new_follower_done>len(rf.entries)-1 {
+				err_pr("BUG:%d new:%d len-1:%d\n", rf.me, new_follower_done, len(rf.entries)-1)
 				return
 			}
 			rf.lastApplied=new_follower_done
@@ -848,7 +887,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	isLeader=rf.isleader
 	//index=rf.lastApplied+1 //第一个返回值
-	index=rf.commitIndex //本函数的第一个返回值.
+	//index=rf.commitIndex //本函数的第一个返回值.
+	index=len(rf.entries)
+	if index< rf.commitIndex {
+		debug_pr("BUG? %d cmd:%d index:%d < commitidx:%d entries:%v\n", rf.me,command.(int), index, rf.commitIndex, rf.entries)
+	}
 	term=rf.currentTerm
 	isLeader=rf.isleader
 	if isLeader {
@@ -868,7 +911,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		len_old:=len(rf.entries)
 		rf.entries=append(rf.entries, new)
 		//rf.commitIndex++
-		debug_pr("leader:%d %v\n", rf.me, rf.entries)
+		if  len(rf.entries)<10 {
+			debug_pr("leader:%d %v\n", rf.me, rf.entries)
+		}
 		len_entry:=len(rf.entries)
 		var args AppendEntriesArgs
 		args.Term=rf.currentTerm
@@ -966,6 +1011,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // turn off debug output from this instance.
 //
 func (rf *Raft) Kill() {
+	return
 	// Your code here, if desired.
 	tmp_pr("==== kill %d\n", rf.me)
 	if rf.timer_ele!=nil {
@@ -1069,7 +1115,9 @@ func (rf *Raft) send_empty_entry() bool{
 			//first index is 1
 			//-----------
 			len_old:=len(rf.entries)
-			debug_pr("leader:%d %v\n", rf.me, rf.entries)
+			if len_old<10 {
+				debug_pr("leader:%d %v\n", rf.me, rf.entries)
+			}
 			//len_entry:=len(rf.entries)
 			//每个节点的进度不一样, 故args的初始化放在各线程内.
 			var args AppendEntriesArgs
@@ -1109,8 +1157,20 @@ func (rf *Raft) send_empty_entry() bool{
 		tmp:= <- ch_total_accept_heart
 		total_accept_heart+=tmp
 		// 这里可以处理   leader变动, 导致follower没有执行apply
+		//进入send empty, 那么, 之前获得了vote, 故是最新的.
+		//accept代表follower更新了数据, 故这里可以apply, 对吗?
 		if total_accept_heart> nr_node/2 {
-			rf.set_lastApplied(lastone_idx)
+			//这个返回时,  lastApplied 可能早就更新过了.
+			if currentTerm_before_send==rf.currentTerm {
+			debug_pr("%d set apply %d in send empty\n", rf.me, lastone_idx)
+			lastone_idx:=rf.lastone_ent().Index
+			rf.apply(rf.lastApplied+1, lastone_idx+1)
+			/*
+			rf.set_lastApplied(lastone_idx) 
+			*/ 
+			//lastone_idx:=rf.lastone_ent().Index
+			rf.commitIndex=lastone_idx
+			}
 		}
 		//todo major 拒绝 就返回
 	}
@@ -1191,11 +1251,14 @@ func (rf *Raft) be_leader() {
 		time_pr("%d already leader, exit\n", rf.me)
 		return
 	}
+	old_term:=rf.currentTerm
 	if !rf.send_empty_entry(){
 		return
 	}
-	//time_pr("====%d now leader\n", rf.me)
-	info_pr("====%d now leader, term:%d\n", rf.me, rf.currentTerm)
+	if rf.currentTerm==old_term {
+		info_pr("====%d now leader, term:%d\n", rf.me, rf.currentTerm)
+		rf.commitIndex=len(rf.entries)
+	}
 	rf.isleader=true
 	
 	if rf.once_heartbeat {
